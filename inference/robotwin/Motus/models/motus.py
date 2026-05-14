@@ -7,6 +7,7 @@ import json
 import torch
 import logging
 import torch.nn as nn
+from collections.abc import Mapping
 from pathlib import Path
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, Tuple
@@ -380,10 +381,70 @@ class UndModule(nn.Module):
         # Get input embeddings
         inputs_embeds = self.vlm_model.get_input_embeddings()(input_ids_batch)
 
-        # Process images - handle different return formats between Qwen2.5-VL and Qwen3-VL
-        image_embeds, deepstack_image_embeds = self.vlm_model.get_image_features(pixel_values_batch, image_grid_thw_batch)
+        # Process images - Qwen VLM variants differ on whether they return a
+        # tensor, a container of tensors, or a dict-like output with metadata.
+        image_feature_outputs = self.vlm_model.get_image_features(pixel_values_batch, image_grid_thw_batch)
 
-        image_embeds = torch.cat(image_embeds, dim=0).to(self.device, self.dtype)
+        def _extract_tensor_payload(payload, *, field_name: str):
+            if payload is None or isinstance(payload, torch.Tensor):
+                return payload
+
+            if isinstance(payload, (list, tuple)) and payload and all(isinstance(item, torch.Tensor) for item in payload):
+                return payload
+
+            if isinstance(payload, Mapping):
+                for candidate_key in (field_name, 'image_embeds', 'visual_embeds', 'embeds', 'features'):
+                    candidate = payload.get(candidate_key)
+                    if isinstance(candidate, (torch.Tensor, list, tuple)):
+                        return candidate
+                return None
+
+            for candidate_attr in (field_name, 'image_embeds', 'visual_embeds', 'embeds', 'features'):
+                candidate = getattr(payload, candidate_attr, None)
+                if isinstance(candidate, (torch.Tensor, list, tuple)):
+                    return candidate
+
+            return payload
+
+        def _coerce_image_tensor(payload, *, name: str):
+            payload = _extract_tensor_payload(payload, field_name=name)
+            if payload is None:
+                return None
+            if isinstance(payload, torch.Tensor):
+                return payload.to(self.device, self.dtype)
+            if isinstance(payload, (list, tuple)):
+                tensor_items = [item for item in payload if isinstance(item, torch.Tensor)]
+                if not tensor_items:
+                    raise TypeError(f"{name} did not contain any tensor items (got {type(payload).__name__})")
+                return torch.cat(tensor_items, dim=0).to(self.device, self.dtype)
+            raise TypeError(f"Unsupported {name} payload type: {type(payload).__name__}")
+
+        deepstack_image_embeds = None
+        image_embeds = None
+
+        if hasattr(image_feature_outputs, 'pooler_output'):
+            image_embeds = image_feature_outputs.pooler_output
+            deepstack_image_embeds = getattr(image_feature_outputs, 'deepstack_features', None)
+        elif isinstance(image_feature_outputs, Mapping):
+            image_embeds = image_feature_outputs.get('pooler_output')
+            if image_embeds is None:
+                image_embeds = image_feature_outputs.get('image_embeds')
+            deepstack_image_embeds = image_feature_outputs.get('deepstack_features')
+        elif isinstance(image_feature_outputs, tuple):
+            image_embeds = image_feature_outputs[0] if len(image_feature_outputs) > 0 else None
+            deepstack_image_embeds = image_feature_outputs[1] if len(image_feature_outputs) > 1 else None
+        else:
+            image_embeds = image_feature_outputs
+
+        image_embeds = _coerce_image_tensor(image_embeds, name='image_embeds')
+        if image_embeds is None:
+            raise TypeError(f"Unable to extract tensor image embeddings from {type(image_feature_outputs).__name__}")
+
+        if isinstance(deepstack_image_embeds, torch.Tensor):
+            deepstack_image_embeds = deepstack_image_embeds.to(self.device, self.dtype)
+        elif isinstance(deepstack_image_embeds, (list, tuple)):
+            deepstack_items = [embed.to(self.device, self.dtype) for embed in deepstack_image_embeds if isinstance(embed, torch.Tensor)]
+            deepstack_image_embeds = deepstack_items or None
 
         # Insert image embeddings
         image_mask, _ = self.vlm_model.model.get_placeholder_mask(
@@ -393,10 +454,17 @@ class UndModule(nn.Module):
 
         visual_pos_masks = image_mask[..., 0]  # [B, seq_len] - visual positions only
 
-        # Compute position_ids (position_ids remains as original: [3, B, seq_len])
-        # Qwen3-VL get_rope_index has different signature: (input_ids, image_grid_thw, video_grid_thw, attention_mask)
+        mm_token_type_ids = torch.zeros_like(input_ids_batch, dtype=torch.int)
+        image_token_id = self.vlm_model.config.image_token_id
+        mm_token_type_ids[input_ids_batch == image_token_id] = 1
+        video_token_id = getattr(self.vlm_model.config, 'video_token_id', None)
+        if video_token_id is not None:
+            mm_token_type_ids[input_ids_batch == video_token_id] = 2
+
+        # Compute position_ids for Qwen3-VL with explicit multimodal token types.
         position_ids, _rope_deltas = self.vlm_model.model.get_rope_index(
             input_ids=input_ids_batch,
+            mm_token_type_ids=mm_token_type_ids,
             image_grid_thw=image_grid_thw_batch,
             video_grid_thw=None,  # No video in current implementation
             attention_mask=attention_mask_batch
